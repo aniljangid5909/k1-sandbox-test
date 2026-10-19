@@ -1,0 +1,129 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>K1 sandbox form</title><script>
+/* JimGlo attribution persistence (K1) v2
+ *
+ * What it does
+ * - On any page load whose URL carries utm_source, utm_medium, utm_campaign,
+ *   utm_content, utm_term, gclid or fbclid, stores those values (campaign
+ *   metadata only) in localStorage under "jg_attr":
+ *     first = first qualifying visit (never overwritten while it is < 90 days old)
+ *     last  = most recent qualifying visit
+ *   Visits without campaign parameters change nothing.
+ * - When a form is submitted on a page whose URL has none of those
+ *   parameters, it briefly adds the stored "last" values to the address bar
+ *   so GHL External Tracking (which reads location.href synchronously in its
+ *   form-level submit listener) records them, then restores the original URL
+ *   before GA4's submit listener runs.
+ *
+ * Why it is safe for the other tags
+ * - Uses the browser's native History.prototype.replaceState. GA4, Meta Pixel
+ *   and Clarity wrap the history.replaceState *instance* property to detect
+ *   SPA navigation; calling the prototype method bypasses those wrappers, so
+ *   no extra page views are sent. Native replaceState fires no events.
+ * - Never calls preventDefault/stopPropagation; Webflow validation, reCAPTCHA
+ *   and redirects are untouched. Never edits links. Makes no network requests.
+ *
+ * Limitations
+ * - localStorage only: per browser/device, cleared with site data, not
+ *   available in some private modes (the script then does nothing).
+ * - Exposes "last" only; "first" is stored for later use (not sent to GHL).
+ * - Must sit in the site-wide Head code ABOVE the GHL external-tracking.js tag.
+ * - No consent gating: the site has no consent mechanism today. If one is
+ *   added, gate the save() call on it.
+ */
+(function () {
+  'use strict';
+  var KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'gclid', 'fbclid'];
+  var STORE = 'jg_attr';
+  var TTL = 90 * 24 * 60 * 60 * 1000;
+  var MAX_LEN = 200;
+  var nativeReplace = window.History && History.prototype.replaceState;
+  if (!nativeReplace || !window.URL || !window.URLSearchParams) return;
+
+  function load() {
+    try {
+      var d = JSON.parse(localStorage.getItem(STORE));
+      return d && typeof d === 'object' ? d : {};
+    } catch (e) { return {}; }
+  }
+  function save(d) {
+    try { localStorage.setItem(STORE, JSON.stringify(d)); } catch (e) {}
+  }
+  function fresh(t) {
+    var age = t && typeof t.ts === 'number' ? Date.now() - t.ts : -1;
+    return !!(t && t.p && typeof t.p === 'object' && age >= 0 && age < TTL);
+  }
+  function hasCampaign(params) {
+    for (var i = 0; i < KEYS.length; i++) if (params.has(KEYS[i])) return true;
+    return false;
+  }
+
+  // 1. Record a qualifying campaign visit.
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var found = {}, n = 0;
+    KEYS.forEach(function (k) {
+      var v = params.get(k);
+      if (v && v.trim()) { found[k] = v.trim().slice(0, MAX_LEN); n++; }
+    });
+    if (n) {
+      var data = load();
+      var touch = { p: found, path: window.location.pathname, ts: Date.now() };
+      if (!fresh(data.first)) data.first = touch;
+      data.last = touch;
+      save(data);
+    }
+  } catch (e) {}
+
+  // 2. At submit, expose stored last-touch params to GHL, then restore.
+  var original = null;
+  function restore() {
+    if (original === null) return;
+    var target = original;
+    original = null;
+    try { nativeReplace.call(history, history.state, '', target); } catch (e) {}
+  }
+
+  window.addEventListener('submit', function (ev) {
+    try {
+      if (!ev.target || ev.target.tagName !== 'FORM' || original !== null) return;
+      var d = load();
+      if (!fresh(d.last)) return;
+      var url = new URL(window.location.href);
+      if (hasCampaign(url.searchParams)) return; // explicit params always win
+      KEYS.forEach(function (k) {
+        var v = d.last.p[k];
+        if (typeof v === 'string' && v) url.searchParams.set(k, v.slice(0, MAX_LEN));
+      });
+      if (url.href === window.location.href) return;
+      original = window.location.href;
+      nativeReplace.call(history, history.state, '', url.href);
+      setTimeout(restore, 0); // safety net if the document listener below never runs
+    } catch (e) { original = null; }
+  }, true);
+
+  // Bubble-phase on document, registered before GA4 loads: runs after GHL's
+  // form-level read and before GA4's own document submit listener.
+  document.addEventListener('submit', restore, false);
+})();
+</script>
+<script>
+/* SANDBOX ONLY. Set the sandbox sub-account's tracking ID here. The tracker is
+   loaded only if the ID is set and is NOT JimGlo production (tk_e535c618...). */
+(function(){var SANDBOX_ID='tk_51f05be5128840fbb2f1a1d161d25107';
+ var ok=/^tk_[0-9a-f]{32}$/.test(SANDBOX_ID)&&SANDBOX_ID.indexOf('tk_e535c618')!==0;
+ if(!ok){document.addEventListener('DOMContentLoaded',function(){document.body.innerHTML='<h1>Blocked: set a valid SANDBOX tracking ID first.</h1>'});return;}
+ var s=document.createElement('script');s.src='https://link.msgsndr.com/js/external-tracking.js';s.async=false;
+ s.setAttribute('data-tracking-id',SANDBOX_ID);document.head.appendChild(s);})();
+</script></head><body style="font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px">
+<h1>K1 sandbox — form page</h1>
+<form id="k1-sandbox-test-form" name="k1-sandbox-test-form">
+<p><label>First name <input name="first_name" required></label></p>
+<p><label>Email <input type="email" name="email" required></label></p>
+<p><button type="submit">Submit test</button></p></form>
+<p id="done" hidden>Submitted to the sandbox. Address bar should show no campaign parameters.</p>
+<pre id="state"></pre>
+<script>
+/* Mirrors Webflow: handled in a later document-bubble listener; no navigation, so no form data ends up in a URL. */
+document.addEventListener('submit',function(e){e.preventDefault();document.getElementById('done').hidden=false;
+ document.getElementById('state').textContent='location after submit: '+location.pathname+location.search+location.hash;},false);
+</script></body></html>
