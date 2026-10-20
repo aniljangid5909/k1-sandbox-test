@@ -1,18 +1,32 @@
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>K1 sandbox landing</title><script>
-/* JimGlo attribution persistence (K1) v2
+/* JimGlo attribution persistence (K1) v3
  *
  * What it does
  * - On any page load whose URL carries utm_source, utm_medium, utm_campaign,
  *   utm_content, utm_term, gclid or fbclid, stores those values (campaign
  *   metadata only) in localStorage under "jg_attr":
  *     first = first qualifying visit (never overwritten while it is < 90 days old)
- *     last  = most recent qualifying visit
+ *     last  = most recent qualifying visit (replaced as a whole set)
  *   Visits without campaign parameters change nothing.
- * - When a form is submitted on a page whose URL has none of those
- *   parameters, it briefly adds the stored "last" values to the address bar
- *   so GHL External Tracking (which reads location.href synchronously in its
- *   form-level submit listener) records them, then restores the original URL
- *   before GA4's submit listener runs.
+ * - Latest touch -> GHL native attribution: when a form is submitted on a page
+ *   whose URL has none of those parameters, it briefly adds the stored "last"
+ *   values to the address bar so GHL External Tracking (which reads
+ *   location.href synchronously in its form-level submit listener) records
+ *   them, then restores the original URL before GA4's submit listener runs.
+ * - Original (first) touch -> form field: any field inside a submitted form
+ *   marked data-jg-attr="original" receives a readable one-line summary of
+ *   "first", e.g.
+ *     utm_source=google | utm_medium=cpc | utm_campaign=spring | gclid=abc | landing=/enclosed-car-trailer | first_seen=2026-10-19T21:39Z
+ *   (empty when there is no fresh first touch). How that field reaches the
+ *   GHL "Original Attribution" contact field is configured outside this script.
+ *
+ * Opt-out (checked on load and again at every submit)
+ * - Opted out when ANY of: window.jgAttrOptOut === true; the Global Privacy
+ *   Control signal (navigator.globalPrivacyControl === true, if HONOR_GPC);
+ *   or the consent banner's opt-out cookie (OPT_OUT_COOKIE / OPT_OUT_MATCH,
+ *   left empty until the real banner's cookie is verified).
+ * - When opted out it deletes "jg_attr", stores nothing, exposes nothing and
+ *   clears any data-jg-attr="original" field.
  *
  * Why it is safe for the other tags
  * - Uses the browser's native History.prototype.replaceState. GA4, Meta Pixel
@@ -25,10 +39,7 @@
  * Limitations
  * - localStorage only: per browser/device, cleared with site data, not
  *   available in some private modes (the script then does nothing).
- * - Exposes "last" only; "first" is stored for later use (not sent to GHL).
  * - Must sit in the site-wide Head code ABOVE the GHL external-tracking.js tag.
- * - No consent gating: the site has no consent mechanism today. If one is
- *   added, gate the save() call on it.
  */
 (function () {
   'use strict';
@@ -36,9 +47,38 @@
   var STORE = 'jg_attr';
   var TTL = 90 * 24 * 60 * 60 * 1000;
   var MAX_LEN = 200;
+  var MAX_SUMMARY = 1000;
+  var HONOR_GPC = true;
+  var OPT_OUT_COOKIE = '';   // set once the installed banner's opt-out cookie is verified
+  var OPT_OUT_MATCH = null;  // RegExp tested against that cookie's decoded value
+  var cfg = window.jgAttrConfig;
+  if (cfg && typeof cfg === 'object') {
+    if (typeof cfg.honorGPC === 'boolean') HONOR_GPC = cfg.honorGPC;
+    if (typeof cfg.optOutCookie === 'string') OPT_OUT_COOKIE = cfg.optOutCookie;
+    if (cfg.optOutMatch instanceof RegExp) OPT_OUT_MATCH = cfg.optOutMatch;
+  }
   var nativeReplace = window.History && History.prototype.replaceState;
   if (!nativeReplace || !window.URL || !window.URLSearchParams) return;
 
+  function readCookie(name) {
+    var parts = ('; ' + document.cookie).split('; ' + name + '=');
+    if (parts.length < 2) return null;
+    try { return decodeURIComponent(parts.pop().split(';')[0]); } catch (e) { return null; }
+  }
+  function optedOut() {
+    try {
+      if (window.jgAttrOptOut === true) return true;
+      if (HONOR_GPC && navigator.globalPrivacyControl === true) return true;
+      if (OPT_OUT_COOKIE && OPT_OUT_MATCH) {
+        var v = readCookie(OPT_OUT_COOKIE);
+        if (v !== null && OPT_OUT_MATCH.test(v)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function forget() {
+    try { localStorage.removeItem(STORE); } catch (e) {}
+  }
   function load() {
     try {
       var d = JSON.parse(localStorage.getItem(STORE));
@@ -56,25 +96,55 @@
     for (var i = 0; i < KEYS.length; i++) if (params.has(KEYS[i])) return true;
     return false;
   }
-
-  // 1. Record a qualifying campaign visit.
-  try {
-    var params = new URLSearchParams(window.location.search);
-    var found = {}, n = 0;
+  function clean(v) {
+    return String(v).replace(/[\u0000-\u001f\u007f|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_LEN);
+  }
+  function summary(t) {
+    if (!fresh(t)) return '';
+    var out = [];
     KEYS.forEach(function (k) {
-      var v = params.get(k);
-      if (v && v.trim()) { found[k] = v.trim().slice(0, MAX_LEN); n++; }
+      var v = t.p[k];
+      if (typeof v === 'string' && v) { v = clean(v); if (v) out.push(k + '=' + v); }
     });
-    if (n) {
-      var data = load();
-      var touch = { p: found, path: window.location.pathname, ts: Date.now() };
-      if (!fresh(data.first)) data.first = touch;
-      data.last = touch;
-      save(data);
+    if (!out.length) return '';
+    if (typeof t.path === 'string' && t.path) out.push('landing=' + clean(t.path));
+    out.push('first_seen=' + new Date(t.ts).toISOString().slice(0, 16) + 'Z');
+    return out.join(' | ').slice(0, MAX_SUMMARY);
+  }
+  function fillOriginal(root, value) {
+    try {
+      var els = root.querySelectorAll('[data-jg-attr="original"]');
+      for (var i = 0; i < els.length; i++) els[i].value = value;
+    } catch (e) {}
+  }
+
+  // 1. Record a qualifying campaign visit (or forget everything if opted out).
+  try {
+    if (optedOut()) {
+      forget();
+    } else {
+      var params = new URLSearchParams(window.location.search);
+      var found = {}, n = 0;
+      KEYS.forEach(function (k) {
+        var v = params.get(k);
+        if (v && v.trim()) { found[k] = v.trim().slice(0, MAX_LEN); n++; }
+      });
+      if (n) {
+        var data = load();
+        var touch = { p: found, path: window.location.pathname, ts: Date.now() };
+        if (!fresh(data.first)) data.first = touch;
+        data.last = touch;
+        save(data);
+      }
     }
   } catch (e) {}
 
-  // 2. At submit, expose stored last-touch params to GHL, then restore.
+  // Pre-fill original-attribution fields once the DOM exists (refreshed again at submit).
+  document.addEventListener('DOMContentLoaded', function () {
+    fillOriginal(document, optedOut() ? '' : summary(load().first));
+  });
+
+  // 2. At submit: fill the original-touch field, expose last-touch params to GHL, then restore.
   var original = null;
   function restore() {
     if (original === null) return;
@@ -86,7 +156,9 @@
   window.addEventListener('submit', function (ev) {
     try {
       if (!ev.target || ev.target.tagName !== 'FORM' || original !== null) return;
+      if (optedOut()) { forget(); fillOriginal(ev.target, ''); return; }
       var d = load();
+      fillOriginal(ev.target, summary(d.first));
       if (!fresh(d.last)) return;
       var url = new URL(window.location.href);
       if (hasCampaign(url.searchParams)) return; // explicit params always win
