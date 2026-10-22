@@ -1,0 +1,339 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>K1 sandbox embed</title><script>
+/* JimGlo attribution persistence (K1) v3
+ *
+ * What it does
+ * - On any page load whose URL carries utm_source, utm_medium, utm_campaign,
+ *   utm_content, utm_term, gclid or fbclid, stores those values (campaign
+ *   metadata only) in localStorage under "jg_attr":
+ *     first = first qualifying visit (never overwritten while it is < 90 days old)
+ *     last  = most recent qualifying visit (replaced as a whole set)
+ *   Visits without campaign parameters change nothing.
+ * - Latest touch -> GHL native attribution: when a form is submitted on a page
+ *   whose URL has none of those parameters, it briefly adds the stored "last"
+ *   values to the address bar so GHL External Tracking (which reads
+ *   location.href synchronously in its form-level submit listener) records
+ *   them, then restores the original URL before GA4's submit listener runs.
+ * - Original (first) touch -> form field: any field inside a submitted form
+ *   marked data-jg-attr="original" receives a readable one-line summary of
+ *   "first", e.g.
+ *     utm_source=google | utm_medium=cpc | utm_campaign=spring | gclid=abc | landing=/enclosed-car-trailer | first_seen=2026-10-19T21:39Z
+ *   (empty when there is no fresh first touch). How that field reaches the
+ *   GHL "Original Attribution" contact field is configured outside this script.
+ *
+ * Opt-out (checked on load and again at every submit)
+ * - Opted out when ANY of: window.jgAttrOptOut === true; the Global Privacy
+ *   Control signal (navigator.globalPrivacyControl === true, if HONOR_GPC);
+ *   or the consent banner's opt-out cookie (OPT_OUT_COOKIE / OPT_OUT_MATCH,
+ *   left empty until the real banner's cookie is verified).
+ * - When opted out it deletes "jg_attr", stores nothing, exposes nothing and
+ *   clears any data-jg-attr="original" field.
+ *
+ * Why it is safe for the other tags
+ * - Uses the browser's native History.prototype.replaceState. GA4, Meta Pixel
+ *   and Clarity wrap the history.replaceState *instance* property to detect
+ *   SPA navigation; calling the prototype method bypasses those wrappers, so
+ *   no extra page views are sent. Native replaceState fires no events.
+ * - Never calls preventDefault/stopPropagation; Webflow validation, reCAPTCHA
+ *   and redirects are untouched. Never edits links. Makes no network requests.
+ *
+ * Limitations
+ * - localStorage only: per browser/device, cleared with site data, not
+ *   available in some private modes (the script then does nothing).
+ * - Must sit in the site-wide Head code ABOVE the GHL external-tracking.js tag.
+ */
+(function () {
+  'use strict';
+  var KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'gclid', 'fbclid'];
+  var STORE = 'jg_attr';
+  var TTL = 90 * 24 * 60 * 60 * 1000;
+  var MAX_LEN = 200;
+  var MAX_SUMMARY = 1000;
+  var HONOR_GPC = true;
+  var OPT_OUT_COOKIE = '';   // set once the installed banner's opt-out cookie is verified
+  var OPT_OUT_MATCH = null;  // RegExp tested against that cookie's decoded value
+  var cfg = window.jgAttrConfig;
+  if (cfg && typeof cfg === 'object') {
+    if (typeof cfg.honorGPC === 'boolean') HONOR_GPC = cfg.honorGPC;
+    if (typeof cfg.optOutCookie === 'string') OPT_OUT_COOKIE = cfg.optOutCookie;
+    if (cfg.optOutMatch instanceof RegExp) OPT_OUT_MATCH = cfg.optOutMatch;
+  }
+  var nativeReplace = window.History && History.prototype.replaceState;
+  if (!nativeReplace || !window.URL || !window.URLSearchParams) return;
+
+  function readCookie(name) {
+    var parts = ('; ' + document.cookie).split('; ' + name + '=');
+    if (parts.length < 2) return null;
+    try { return decodeURIComponent(parts.pop().split(';')[0]); } catch (e) { return null; }
+  }
+  function optedOut() {
+    try {
+      if (window.jgAttrOptOut === true) return true;
+      if (HONOR_GPC && navigator.globalPrivacyControl === true) return true;
+      if (OPT_OUT_COOKIE && OPT_OUT_MATCH) {
+        var v = readCookie(OPT_OUT_COOKIE);
+        if (v !== null && OPT_OUT_MATCH.test(v)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function forget() {
+    try { localStorage.removeItem(STORE); } catch (e) {}
+  }
+  function load() {
+    try {
+      var d = JSON.parse(localStorage.getItem(STORE));
+      return d && typeof d === 'object' ? d : {};
+    } catch (e) { return {}; }
+  }
+  function save(d) {
+    try { localStorage.setItem(STORE, JSON.stringify(d)); } catch (e) {}
+  }
+  function fresh(t) {
+    var age = t && typeof t.ts === 'number' ? Date.now() - t.ts : -1;
+    return !!(t && t.p && typeof t.p === 'object' && age >= 0 && age < TTL);
+  }
+  function hasCampaign(params) {
+    for (var i = 0; i < KEYS.length; i++) if (params.has(KEYS[i])) return true;
+    return false;
+  }
+  function clean(v) {
+    return String(v).replace(/[\u0000-\u001f\u007f|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_LEN);
+  }
+  function summary(t) {
+    if (!fresh(t)) return '';
+    var out = [];
+    KEYS.forEach(function (k) {
+      var v = t.p[k];
+      if (typeof v === 'string' && v) { v = clean(v); if (v) out.push(k + '=' + v); }
+    });
+    if (!out.length) return '';
+    if (typeof t.path === 'string' && t.path) out.push('landing=' + clean(t.path));
+    out.push('first_seen=' + new Date(t.ts).toISOString().slice(0, 16) + 'Z');
+    return out.join(' | ').slice(0, MAX_SUMMARY);
+  }
+  function fillOriginal(root, value) {
+    try {
+      var els = root.querySelectorAll('[data-jg-attr="original"]');
+      for (var i = 0; i < els.length; i++) els[i].value = value;
+    } catch (e) {}
+  }
+
+  // 1. Record a qualifying campaign visit (or forget everything if opted out).
+  try {
+    if (optedOut()) {
+      forget();
+    } else {
+      var params = new URLSearchParams(window.location.search);
+      var found = {}, n = 0;
+      KEYS.forEach(function (k) {
+        var v = params.get(k);
+        if (v && v.trim()) { found[k] = v.trim().slice(0, MAX_LEN); n++; }
+      });
+      if (n) {
+        var data = load();
+        var touch = { p: found, path: window.location.pathname, ts: Date.now() };
+        if (!fresh(data.first)) data.first = touch;
+        data.last = touch;
+        save(data);
+      }
+    }
+  } catch (e) {}
+
+  // Pre-fill original-attribution fields once the DOM exists (refreshed again at submit).
+  document.addEventListener('DOMContentLoaded', function () {
+    fillOriginal(document, optedOut() ? '' : summary(load().first));
+  });
+
+  // 2. At submit: fill the original-touch field, expose last-touch params to GHL, then restore.
+  var original = null;
+  function restore() {
+    if (original === null) return;
+    var target = original;
+    original = null;
+    try { nativeReplace.call(history, history.state, '', target); } catch (e) {}
+  }
+
+  window.addEventListener('submit', function (ev) {
+    try {
+      if (!ev.target || ev.target.tagName !== 'FORM' || original !== null) return;
+      if (optedOut()) { forget(); fillOriginal(ev.target, ''); return; }
+      var d = load();
+      fillOriginal(ev.target, summary(d.first));
+      if (!fresh(d.last)) return;
+      var url = new URL(window.location.href);
+      if (hasCampaign(url.searchParams)) return; // explicit params always win
+      KEYS.forEach(function (k) {
+        var v = d.last.p[k];
+        if (typeof v === 'string' && v) url.searchParams.set(k, v.slice(0, MAX_LEN));
+      });
+      if (url.href === window.location.href) return;
+      original = window.location.href;
+      nativeReplace.call(history, history.state, '', url.href);
+      setTimeout(restore, 0); // safety net if the document listener below never runs
+    } catch (e) { original = null; }
+  }, true);
+
+  // Bubble-phase on document, registered before GA4 loads: runs after GHL's
+  // form-level read and before GA4's own document submit listener.
+  document.addEventListener('submit', restore, false);
+})();
+</script>
+<script>
+/* JimGlo K1-ID v2 (fragment-first): known-contact identification for GHL External Tracking
+ * *** PROTOTYPE: NOT APPROVED, NOT DEPLOYED. Local testing only. ***
+ * Recommended link format: https://www.jimglo.com/<page>?<utm params>#jg_cid={{contact.id}}
+ *   (the fragment is never sent to any server or in any Referer; the query form ?jg_cid= is
+ *   still accepted for compatibility but exposes the id in the document request and in the
+ *   Referer of same-origin requests made before this script runs; see K1-ID-RISK-REVIEW.md).
+ * - Reads jg_cid from the fragment (#jg_cid=ID or #anchor&jg_cid=ID) or, failing that, the query.
+ * - Removes every jg_cid from both the fragment and the query at once (native
+ *   History.prototype.replaceState); other params/anchor text are kept byte-for-byte.
+ *   A combined "#anchor&jg_cid=" link does NOT auto-scroll to #anchor (limitation).
+ * - Writes only _ud.contactId (other _ud properties kept); bookkeeping in "jg_id" {cid, ts}
+ *   so expiry removes only the id it wrote. Ids must match ID_RE (observed GHL format).
+ * - Opt-out (jgAttrOptOut / GPC with HONOR_GPC): stores nothing, removes its earlier id.
+ * - Expiry: TTL after the last ACCEPTED link click. Not an authentication credential.
+ * Placement: site Head, after K1, before the GHL external-tracking.js tag.
+ */
+(function () {
+  'use strict';
+  var PARAM = 'jg_cid';
+  var ID_RE = /^[A-Za-z0-9]{20}$/;
+  var META = 'jg_id';
+  var DAY = 24 * 60 * 60 * 1000;
+  var TTL = 30 * DAY;
+  var HONOR_GPC = true;
+  var cfg = window.jgAttrConfig;
+  if (cfg && typeof cfg === 'object') {
+    if (typeof cfg.honorGPC === 'boolean') HONOR_GPC = cfg.honorGPC;
+    if (typeof cfg.idTtlDays === 'number' && cfg.idTtlDays > 0) TTL = cfg.idTtlDays * DAY;
+  }
+  var nativeReplace = window.History && History.prototype.replaceState;
+
+  function optedOut() {
+    try {
+      if (window.jgAttrOptOut === true) return true;
+      if (HONOR_GPC && navigator.globalPrivacyControl === true) return true;
+    } catch (e) {}
+    return false;
+  }
+  // {ok:true, ud:{...}} when _ud is absent or a plain object; {ok:false} when unreadable/malformed (left untouched).
+  function readUd() {
+    var raw;
+    try { raw = localStorage.getItem('_ud'); } catch (e) { return { ok: false }; }
+    if (raw === null) return { ok: true, ud: {} };
+    try {
+      var d = JSON.parse(raw);
+      if (d && typeof d === 'object' && !Array.isArray(d)) return { ok: true, ud: d };
+    } catch (e) {}
+    return { ok: false };
+  }
+  function writeUd(d) {
+    try {
+      if (Object.keys(d).length) localStorage.setItem('_ud', JSON.stringify(d));
+      else localStorage.removeItem('_ud');
+    } catch (e) {}
+  }
+  function readMeta() {
+    try {
+      var m = JSON.parse(localStorage.getItem(META));
+      if (m && typeof m.cid === 'string' && typeof m.ts === 'number') return m;
+    } catch (e) {}
+    return null;
+  }
+  // Remove only the id this script stored (if _ud still holds it), then the bookkeeping.
+  function forgetOwn() {
+    var m = readMeta();
+    try { localStorage.removeItem(META); } catch (e) {}
+    if (!m) return;
+    var r = readUd();
+    if (r.ok && r.ud.contactId === m.cid) { delete r.ud.contactId; writeUd(r.ud); }
+  }
+  // Split "a&b&c", drop every PARAM pair, return {found, kept[]} (others untouched, no re-encoding).
+  function scan(str, state) {
+    var kept = [];
+    str.split('&').forEach(function (pair) {
+      var k = pair.split('=')[0], key;
+      try { key = decodeURIComponent(k.replace(/\+/g, ' ')); } catch (e) { key = k; }
+      if (key === PARAM) {
+        state.hit = true;
+        if (state.found === null) {
+          var v = pair.indexOf('=') >= 0 ? pair.slice(pair.indexOf('=') + 1) : '';
+          try { state.found = decodeURIComponent(v.replace(/\+/g, ' ')); } catch (e) { state.found = ''; }
+        }
+      } else if (pair !== '') kept.push(pair);
+    });
+    return kept;
+  }
+  // Fragment first, then query. Removes PARAM from both; returns the first id seen (fragment wins).
+  function stripParam() {
+    var frag = { found: null, hit: false }, qry = { found: null, hit: false };
+    try {
+      var h = window.location.hash, s = window.location.search;
+      var hk = h && h.length > 1 ? scan(h.slice(1), frag) : null;
+      var qk = s && s.length > 1 ? scan(s.slice(1), qry) : null;
+      if ((frag.hit || qry.hit) && nativeReplace) {
+        var target = window.location.pathname +
+          (qry.hit ? (qk.length ? '?' + qk.join('&') : '') : s) +
+          (frag.hit ? (hk.length ? '#' + hk.join('&') : '') : h);
+        nativeReplace.call(history, history.state, '', target);
+      }
+    } catch (e) {}
+    return frag.found !== null ? frag.found : qry.found;
+  }
+
+  try {
+    var cid = stripParam();
+    if (optedOut()) { forgetOwn(); return; }
+    var m = readMeta();
+    if (m) {
+      var age = Date.now() - m.ts;
+      if (age < 0 || age >= TTL) forgetOwn();
+    }
+    if (cid !== null && ID_RE.test(cid)) {
+      var r = readUd();
+      if (r.ok) {
+        r.ud.contactId = cid;
+        writeUd(r.ud);
+        try { localStorage.setItem(META, JSON.stringify({ cid: cid, ts: Date.now() })); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+})();
+</script>
+<script>
+/* SANDBOX ONLY. Set the sandbox sub-account's tracking ID here. The tracker is
+   loaded only if the ID is set and is NOT JimGlo production (tk_e535c618...). */
+(function(){var SANDBOX_ID='tk_51f05be5128840fbb2f1a1d161d25107';
+ var ok=/^tk_[0-9a-f]{32}$/.test(SANDBOX_ID)&&SANDBOX_ID.indexOf('tk_e535c618')!==0;
+ if(!ok){document.addEventListener('DOMContentLoaded',function(){document.body.innerHTML='<h1>Blocked: set a valid SANDBOX tracking ID first.</h1>'});return;}
+ var s=document.createElement('script');s.src='https://link.msgsndr.com/js/external-tracking.js';s.async=false;
+ s.setAttribute('data-tracking-id',SANDBOX_ID);document.head.appendChild(s);})();
+</script></head><body style="font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px">
+<h1>K1 sandbox — embedded HighLevel form test</h1>
+<p>Sandbox-only diagnostic page: HighLevel form embed (documented embed code) + the sandbox External Tracking script.</p>
+<div style="height:640px">
+<iframe
+    src="https://api.leadconnectorhq.com/widget/form/Tiui7VQBjHzEzjFKgD7S"
+    style="width:100%;height:100%;border:none;border-radius:8px"
+    id="inline-Tiui7VQBjHzEzjFKgD7S"
+    data-layout="{'id':'INLINE'}"
+    data-trigger-type="alwaysShow"
+    data-trigger-value=""
+    data-activation-type="alwaysActivated"
+    data-activation-value=""
+    data-deactivation-type="neverDeactivate"
+    data-deactivation-value=""
+    data-form-name="Form 0"
+    data-height="undefined"
+    data-layout-iframe-id="inline-Tiui7VQBjHzEzjFKgD7S"
+    data-form-id="Tiui7VQBjHzEzjFKgD7S"
+    data-cookie-consent="true"
+    data-cookie-consent-provider="auto"
+    title="Form 0"
+        >
+</iframe>
+<script src="https://link.msgsndr.com/js/form_embed.js"></script>
+</div>
+<p><a id="go" href="landing.html">Go to the landing page</a></p>
+</body></html>
